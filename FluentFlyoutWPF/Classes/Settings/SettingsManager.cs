@@ -1,4 +1,4 @@
-﻿// Copyright (c) 2024-2026 The FluentFlyout Authors
+// Copyright (c) 2024-2026 The FluentFlyout Authors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 using FluentFlyoutWPF.ViewModels;
@@ -22,6 +22,21 @@ public class SettingsManager
     );
 
     private static UserSettings? _current;
+    private static XmlSerializer? _exportSerializer;
+
+    private static XmlSerializer GetExportSerializer()
+    {
+        if (_exportSerializer == null)
+        {
+            XmlAttributeOverrides overrides = new XmlAttributeOverrides();
+            XmlAttributes ignoreAttrs = new XmlAttributes();
+            ignoreAttrs.XmlIgnore = true;
+            overrides.Add(typeof(UserSettings), "Uuid", ignoreAttrs);
+            overrides.Add(typeof(UserSettings), "IsStoreVersion", ignoreAttrs);
+            _exportSerializer = new XmlSerializer(typeof(UserSettings), overrides);
+        }
+        return _exportSerializer;
+    }
 
     private static bool DeserializeSettings(string filePath, out UserSettings? settings)
     {
@@ -56,6 +71,7 @@ public class SettingsManager
     /// <returns>The restored settings.</returns>
     public static UserSettings RestoreSettings(string? filePath = null)
     {
+        bool isImport = filePath != null;
         filePath ??= SettingsFilePath;
         string backupPath = filePath + ".bak";
 
@@ -63,6 +79,12 @@ public class SettingsManager
         {
             if (DeserializeSettings(filePath, out var loadedSettings) && loadedSettings != null)
             {
+                if (isImport && _current != null)
+                {
+                    loadedSettings.Uuid = _current.Uuid;
+                    loadedSettings.IsStoreVersion = _current.IsStoreVersion;
+                }
+
                 _current = loadedSettings;
                 _current.CompleteInitialization();
 
@@ -108,6 +130,7 @@ public class SettingsManager
     /// </summary>
     public static void SaveSettings(string? filePath = null)
     {
+        bool isExport = filePath != null;
         filePath ??= SettingsFilePath;
         string tempPath = filePath + ".tmp";
         string backupPath = filePath + ".bak";
@@ -126,17 +149,47 @@ public class SettingsManager
 
                 using (var writer = new StreamWriter(tempPath, false))
                 {
-                    XmlSerializer xmlSerializer = new(typeof(UserSettings));
+                    XmlSerializer xmlSerializer;
+                    if (isExport)
+                    {
+                        xmlSerializer = GetExportSerializer();
+                    }
+                    else
+                    {
+                        xmlSerializer = new XmlSerializer(typeof(UserSettings));
+                    }
                     xmlSerializer.Serialize(writer, _current);
                 }
 
                 if (File.Exists(filePath))
-                {
-                    File.Replace(tempPath, filePath, backupPath, true);
-                }
+                    _ = Task.Run(async () =>
+                    {
+                        // Run asynchronously to avoid blocking the UI thread
+                        try
+                        {
+                            await TryReplaceSettingsFileAsync(filePath, tempPath, backupPath);
+                            Logger.Info("Settings successfully saved to {0}", filePath);
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.Error(ex, "Error replacing settings file");
+                        }
+                        finally
+                        {
+                            TryDeleteFileIfExists(tempPath);
+                        }
+                    });
                 else
                 {
-                    File.Move(tempPath, filePath, true);
+                    try
+                    {
+                        File.Move(tempPath, filePath, true);
+                        Logger.Info("Settings successfully saved to {0}", filePath);
+                    }
+                    finally
+                    {
+                        TryDeleteFileIfExists(tempPath);
+                    }
                 }
             }
         }
@@ -150,19 +203,55 @@ public class SettingsManager
             // if the settings file cannot be saved
             Logger.Error(ex, "Error saving settings");
         }
-        finally
+    }
+
+    private async static Task TryReplaceSettingsFileAsync(string filePath, string tempPath, string backupPath)
+    {
+        Logger.Debug("Initializing replacing settings file at {0}", filePath);
+        int maxAttempts = 5;
+        // The following steps try to avoid issues with file locks and permissions on some systems.
+        for (int attempts = 1; attempts <= maxAttempts; attempts++)
         {
-            // delete temp file if it still exists
-            if (File.Exists(tempPath))
+            try
             {
-                try
-                {
-                    File.Delete(tempPath);
-                }
-                catch (Exception ex)
-                {
-                    Logger.Error(ex, "Error deleting temporary settings file");
-                }
+                File.Replace(tempPath, filePath, backupPath, ignoreMetadataErrors: true);
+                break;
+            }
+            catch (IOException ex) when (attempts < maxAttempts)
+            {
+                // if the file is locked, wait and retry
+                Logger.Warn(ex, "Settings file is locked, retrying...");
+                Thread.Sleep(75);
+            }
+            catch (IOException ex)
+            {
+                Logger.Warn(ex, "File.Replace failed after retries, manually replacing...");
+                ManualReplace(filePath, tempPath, backupPath);
+                return;
+            }
+        }
+    }
+
+    private static void ManualReplace(string filePath, string tempPath, string backupPath)
+    {
+        TryDeleteFileIfExists(backupPath);
+        File.Copy(filePath, backupPath);
+        TryDeleteFileIfExists(filePath);
+        File.Move(tempPath, filePath);
+    }
+
+    private static void TryDeleteFileIfExists(string path)
+    {
+        // delete file if it still exists
+        if (File.Exists(path))
+        {
+            try
+            {
+                File.Delete(path);
+            }
+            catch (Exception ex)
+            {
+                Logger.Error(ex, "Error deleting file at {0}", path);
             }
         }
     }
